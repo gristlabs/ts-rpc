@@ -45,6 +45,12 @@
  * stubs or for a particular one. If a response to a call does not arrive within the timeout, the
  * call gets rejected, and the rejection Error will have a "code" property set to "TIMEOUT".
  *
+ * Pipes
+ * -----
+ * Pipes allow to create rpc channels over several others rpc channels. In a common usage example,
+ * an endpoint (A) has two rpc channels connected to two endpoint (B) and (C), Rpc pipes make it
+ * possible to create an rpc between (B) and (C) with all messages going through (A).
+ *
  * TODO We may want to support progress callbacks, perhaps by supporting arbitrary callbacks as
  * parameters. (Could be implemented by allowing "meth" to be [reqId, paramPath]) It would be nice
  * to allow the channel to report progress too, e.g. to report progress of uploading large files.
@@ -59,12 +65,52 @@ import {IMessage, IMsgCustom, IMsgRpcCall, IMsgRpcRespData, IMsgRpcRespErr, MsgT
 export type SendMessageCB = (msg: IMessage) => PromiseLike<void> | void;
 
 export class Rpc extends EventEmitter {
-  private _sendMessage: SendMessageCB;
+
+  /**
+   * Forward all messages piped under `name` from on rpc to the other one and vise versa.
+   */
+  public static pipe(name: string, aRpc: Rpc, bRpc: Rpc) {
+    aRpc.pipeToFunction(name, (msg: IMessage) => bRpc.sendMessage(msg));
+    bRpc.pipeToFunction(name, (msg: IMessage) => aRpc.sendMessage(msg));
+  }
+
+  /**
+   * Creates an Rpc instance which will pipe all its messages under `name` over the same channel as
+   * the provided `rpc` without interferring. On the other side of the channel, to forward the piped
+   * messages from the rpc which is received the messages to another rpc for send over another
+   * channel, use `Rpc.pipe` with the same name and both rpcs. Or, to have an rpc instance to handle
+   * the messages call `Rpc.pipeEndpoint` instead with the same name and the rpc receiving messages.
+   *
+   * note: start() has already been called on the returned instance.
+   */
+  public static pipeEndpoint(name: string, rpc: Rpc): Rpc {
+    const endpoint = new Rpc();
+    endpoint.start((msg) => {
+      if (!msg.mpipes) {
+        msg.mpipes = [];
+      }
+      msg.mpipes.push(name);
+      rpc.sendMessage(msg);
+    });
+    // register pipes to route its messages on reception
+    rpc.pipeToFunction(name, (msg: IMessage) => {
+      if (!msg.mpipes) {
+        throw new Error("rpc: msg.mpipes should not be undefined!");
+      }
+      msg.mpipes.pop();
+      endpoint.receiveMessage(msg);
+    });
+    return endpoint;
+  }
+
+  public sendMessage: SendMessageCB;
+
   private _inactiveQueue: IMessage[] | null;
   private _logger: IRpcLogger;
   private _implMap: {[name: string]: Implementation} = {};
   private _pendingCalls: Map<number, ICallObj> = new Map();
   private _nextRequestId = 1;
+  private _pipes: {[name: string]: SendMessageCB} = {};
 
   /**
    * To use Rpc, you must call start() with a function that sends a message to the other side. If
@@ -75,8 +121,8 @@ export class Rpc extends EventEmitter {
     super();
     const {logger = console, sendMessage = inactiveSend} = options;
     this._logger = logger;
-    this._sendMessage = sendMessage;
-    this._inactiveQueue = (this._sendMessage === inactiveSend) ? [] : null;
+    this.sendMessage = sendMessage;
+    this._inactiveQueue = (this.sendMessage === inactiveSend) ? [] : null;
   }
 
   /**
@@ -96,7 +142,7 @@ export class Rpc extends EventEmitter {
    * even if receiveMessage() has already started being called.
    */
   public start(sendMessage: SendMessageCB) {
-    this._sendMessage = sendMessage;
+    this.sendMessage = sendMessage;
     if (this._inactiveQueue) {
       for (const msg of this._inactiveQueue) {
         this._dispatch(msg);    // We need to be careful not to throw from here.
@@ -110,7 +156,7 @@ export class Rpc extends EventEmitter {
    */
   public async postMessage(data: any): Promise<void> {
     const msg: IMsgCustom = {mtype: MsgType.Custom, data};
-    await this._sendMessage(msg);
+    await this.sendMessage(msg);
   }
 
   /**
@@ -187,10 +233,30 @@ export class Rpc extends EventEmitter {
   }
 
   /**
+   * Unregister a afunction, if one was registered with this name.
+   */
+  public unregisterFunc(name: string): void {
+    return this.unregisterImpl(name);
+  }
+
+  /**
    * Call a remote function registered with registerFunc. Does no type checking.
    */
   public callRemoteFunc(name: string, ...args: any[]): Promise<any> {
     return this._makeCall(name, "invoke", args, anyChecker);
+  }
+
+  /**
+   * Redirect all the in-coming message sent from a pipe endpoint with the same name to the
+   * callback. Most of the time you will not use `pipeToFunction` directly but `Rpc.pipe` or
+   * `Rpc.pipeEndpoint` instead.
+   */
+  public pipeToFunction(name: string, cb: (msg: IMessage) => void) {
+    if (this._pipes.hasOwnProperty(name)) {
+      throw new Error(`pipe ${name} already set`);
+    } else {
+      this._pipes[name] = cb;
+    }
   }
 
   private _makeCall(iface: string, meth: string, args: any[], resultChecker: tic.Checker): Promise<any> {
@@ -203,7 +269,7 @@ export class Rpc extends EventEmitter {
       // succeeds, we save {resolve,reject} to resolve _makeCall when we get back a response.
       this._info(callObj, "RPC_CALLING");
       const msg: IMsgRpcCall = {mtype: MsgType.RpcCall, reqId, iface, meth, args};
-      Promise.resolve().then(() => this._sendMessage(msg)).catch((err) => {
+      Promise.resolve().then(() => this.sendMessage(msg)).catch((err) => {
         this._pendingCalls.delete(reqId);
         reject(err);
       });
@@ -211,6 +277,16 @@ export class Rpc extends EventEmitter {
   }
 
   private _dispatch(msg: IMessage): void {
+
+    if (msg.mpipes && msg.mpipes.length) {
+      const pipe = msg.mpipes[msg.mpipes.length - 1];
+      if (this._pipes.hasOwnProperty(pipe)) {
+        this._pipes[pipe](msg);
+        return;
+      }
+      msg.mpipes.pop();
+    }
+
     switch (msg.mtype) {
       case MsgType.RpcCall: { this._onMessageCall(msg); return; }
       case MsgType.RpcRespData:
@@ -258,13 +334,13 @@ export class Rpc extends EventEmitter {
     this._warn(call, reportCode || code, mesg);
     if (call.reqId !== undefined) {
       const msg: IMsgRpcRespErr = {mtype: MsgType.RpcRespErr, reqId: call.reqId, mesg, code};
-      await this._sendMessage(msg);
+      await this.sendMessage(msg);
     }
   }
 
   private async _sendResponse(reqId: number, data: any): Promise<void> {
     const msg: IMsgRpcRespData = {mtype: MsgType.RpcRespData, reqId, data};
-    await this._sendMessage(msg);
+    await this.sendMessage(msg);
   }
 
   private _onMessageResp(resp: IMsgRpcRespData|IMsgRpcRespErr): void {
